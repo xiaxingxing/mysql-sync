@@ -21,6 +21,14 @@
        ↓ 智能增量同步 (3分钟)
   Cloud SQL (35.220.220.225)
 
+✅ MySQL 端口与用途对照表
+| 环境 | 主机 / IP | MySQL 端口 | 主要用途 | 使用账号 | 说明 |
+|---|---|---|---|---|---|
+| **生产服务器（PROD）** | `35.220.164.252` | **3306** | 业务主库 | `monitor_user` | 生产数据源，只读/受限访问，用于同步到中间服务器 |
+| **中间服务器（MIDDLE）** | `localhost` | **3306** | 同步中转库 | `root` | 核心操作库：校验、比对、基线、同步源 |
+| **Cloud SQL（CLOUD）** | `35.220.220.225` | **3306** | 云端目标库 | `root` | 最终云端数据库，同步写入目标 |
+
+
 ═══════════════════════════════════════════════════════════════
 部署清单
 ═══════════════════════════════════════════════════════════════
@@ -236,7 +244,7 @@ SSH登录:
     CREATE DATABASE bynewapi CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
     ```
 =========================================================================
-###准备工作（084f23f3ce683ec1是就服务器root用户的密码，以下新服务器root的密码）
+###准备工作（084f23f3ce683ec1是就服务器root用户的密码，以下换成新服务器root的密码）
 =========================================================================
 
 ##在MySQL生产服务器 (旧服务器IP：35.220.164.252，以下换成新服务器IP)
@@ -363,11 +371,81 @@ mysqldump -h 35.220.220.225 -u root -p'cGd4mQmiAyps6zsmQy@' --single-transaction
     *   重新启动主从复制和同步脚本，以确保新的生产数据能够继续被备份到 Cloud SQL。
 
 
+
+=====================
+##在中间服务器
+====================
+# 1. 配置：/etc/mysql/mysql.conf.d/replication.cnf
+[mysqld]
+
+服务器标识
+server-id=2
+
+Binlog配置
+log_bin=/var/log/mysql/mysql-bin
+binlog_format=ROW
+binlog_row_image=FULL
+expire_logs_days=3
+max_binlog_size=500M
+
+中继日志
+relay_log=/var/log/mysql/relay-bin
+relay_log_recovery=1
+log_slave_updates=1
+
+性能优化
+innodb_buffer_pool_size=1G
+innodb_log_file_size=256M
+max_allowed_packet=1G
+
+安全
+binlog_checksum=CRC32
+master_verify_checksum=1
+slave_sql_verify_checksum=1
+
+# 2. 重启 MySQL：（bash）sudo systemctl restart mysqld
+
+# 3. 从生产服务器拉取备份（以下换成新的ip）
+scp root@35.220.164.252:/tmp/bynewapi_initial.sql ./
+scp root@35.220.164.252:/tmp/bynewapi_initial.sql.md5 ./
+scp root@35.220.164.252:/tmp/master_status.txt ./
+
+# 4. 验证备份完整性
+md5sum -c bynewapi_initial.sql.md5
+
+# 5. 导入数据到中间服务器
+mysql -uroot -p'Middle@Server#2024Pass' < bynewapi_initial.sql
+
+# 6. 配置主从复制（连接到生产服务器）
+# 首先从master_status.txt获取binlog文件名和位置
+BINLOG_FILE=$(grep "File:" master_status.txt | awk '{print $2}')
+BINLOG_POS=$(grep "Position:" master_status.txt | awk '{print $2}')
+
+# 7. 重新指向新生产服务器
+（sql）
+mysql -uroot -p'Middle@Server#2024Pass' << EOF
+STOP SLAVE;
+
+CHANGE MASTER TO
+  MASTER_HOST='35.220.164.252',#换成新的ip
+  MASTER_USER='repl_user',
+  MASTER_PASSWORD='Repl@Pass#2024Secure',
+  MASTER_LOG_FILE='$BINLOG_FILE',
+  MASTER_LOG_POS=$BINLOG_POS;
+
+START SLAVE;
+
+SHOW SLAVE STATUS\G
+EOF
+
 =============
 ### **总结**
 =============
 
 这个恢复方案的核心是利用 `mysqldump` 将 Cloud SQL 上的数据完整地迁移回新的生产服务器。整个流程依赖于您在 `.env` 文件中配置的凭据。强烈建议您在非业务高峰期对这个恢复流程进行演练，以确保在真正发生灾难时能够从容应对。
+
+
+
 
 
 
