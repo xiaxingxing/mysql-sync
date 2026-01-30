@@ -1,9 +1,31 @@
-backups/
+# 环境变量和敏感信息
+.env
+.env.local
+.env.*.local
+
+# 数据库备份（保留目录结构）
+backups/*
+!backups/.gitkeep
 *.sql
 *.dump
-.env
-# 忽略备份文件内容，但保留目录
-backups/*.sql
-backups/*.dump
-# 但不忽略 .gitkeep
-!backups/.gitkeep
+
+# 日志文件
+logs/*.log
+*.log
+
+# 临时和缓存文件
+cache/*
+!cache/.gitkeep
+*.tmp
+*.temp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE 配置
+.vscode/
+.idea/
+*.iml
