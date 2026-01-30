@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+数据保护系统 - 防止误删除和破坏性数据同步
+"""
+
+import pymysql
+import json
+import hashlib
+from datetime import datetime
+from pathlib import Path
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv
+
+load_dotenv('/opt/mysql-sync/.env')
+
+import subprocess
+
+def send_alert(message, severity='CRITICAL'):
+    """发送邮件告警"""
+    try:
+        subprocess.run([
+            'python3',
+            '/opt/mysql-sync/scripts/alert_email.py',
+            message,
+            severity
+        ], timeout=30, check=False)
+        print("  📧 邮件告警已发送")
+    except Exception as e:
+        print(f"  ⚠️  邮件发送失败: {e}")
+
+
+
+class DataProtector:
+    def __init__(self):
+        self.cache_dir = Path('/opt/mysql-sync/cache')
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        self.baseline_file = self.cache_dir / 'baseline.json'
+        self.alert_file = self.cache_dir / 'alerts.json'
+        
+        self.load_baseline()
+        
+    def connect_db(self, prefix='MIDDLE'):
+        """连接数据库"""
+        return pymysql.connect(
+            host=os.getenv(f'{prefix}_HOST'),
+            port=int(os.getenv(f'{prefix}_PORT', 3306)),
+            user=os.getenv(f'{prefix}_USER'),
+            password=os.getenv(f'{prefix}_PASS'),
+            database=os.getenv(f'{prefix}_DB'),
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+    
+    def load_baseline(self):
+        """加载基线数据"""
+        if self.baseline_file.exists():
+            with open(self.baseline_file, 'r') as f:
+                self.baseline = json.load(f)
+        else:
+            self.baseline = {
+                'table_schemas': {},
+                'row_counts': {},
+                'last_update': None
+            }
+    
+    def save_baseline(self):
+        """保存基线数据"""
+        self.baseline['last_update'] = datetime.now().isoformat()
+        with open(self.baseline_file, 'w') as f:
+            json.dump(self.baseline, f, indent=2)
+    
+    def create_baseline(self):
+        """创建基线快照"""
+        print("📸 创建数据基线快照...")
+        
+        conn = self.connect_db('MIDDLE')
+        cursor = conn.cursor()
+        
+        cursor.execute("SHOW TABLES")
+        tables = [list(row.values())[0] for row in cursor.fetchall()]
+        
+        for table in tables:
+            if table.startswith('_'):
+                continue
+            
+            try:
+                # 表结构哈希
+                cursor.execute(f"SHOW CREATE TABLE `{table}`")
+                create_stmt = cursor.fetchone()
+                schema_hash = hashlib.md5(
+                    str(create_stmt).encode()
+                ).hexdigest()
+                
+                self.baseline['table_schemas'][table] = schema_hash
+                
+                # 行数
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM `{table}`")
+                row_count = cursor.fetchone()['cnt']
+                self.baseline['row_counts'][table] = row_count
+                
+                print(f"  ✓ {table}: {row_count:,} rows")
+            except Exception as e:
+                print(f"  ✗ {table}: {e}")
+        
+        cursor.close()
+        conn.close()
+        
+        self.save_baseline()
+        print(f"\n✅ 基线已保存: {len([t for t in tables if not t.startswith('_')])} 个表")
+    
+    def check_delete_anomaly(self):
+        """检测大规模删除"""
+        print("\n🔍 检查数据删除异常...")
+        
+        conn = self.connect_db('MIDDLE')
+        cursor = conn.cursor()
+        
+        alerts = []
+        delete_threshold = float(os.getenv('DELETE_THRESHOLD_PERCENT', 10))
+        
+        for table, baseline_count in self.baseline['row_counts'].items():
+            try:
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM `{table}`")
+                current_count = cursor.fetchone()['cnt']
+                
+                if baseline_count > 0:
+                    decrease_percent = ((baseline_count - current_count) / baseline_count) * 100
+                    
+                    if decrease_percent > delete_threshold:
+                        alert = {
+                            'type': 'MASSIVE_DELETE',
+                            'severity': 'CRITICAL',
+                            'table': table,
+                            'baseline_rows': baseline_count,
+                            'current_rows': current_count,
+                            'decrease_percent': round(decrease_percent, 2),
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        alerts.append(alert)
+                        print(f"  🚨 {table}: {baseline_count:,} → {current_count:,} (-{decrease_percent:.1f}%)")
+                    else:
+                        print(f"  ✓ {table}: {current_count:,} rows")
+                
+            except Exception as e:
+                print(f"  ⚠️  {table}: {e}")
+        
+        cursor.close()
+        conn.close()
+        
+        return alerts
+    
+    def check_schema_change(self):
+        """检测表结构变更"""
+        print("\n🔍 检查表结构变更...")
+        
+        conn = self.connect_db('MIDDLE')
+        cursor = conn.cursor()
+        
+        alerts = []
+        
+        cursor.execute("SHOW TABLES")
+        current_tables = [list(row.values())[0] for row in cursor.fetchall()]
+        
+        for table in current_tables:
+            if table.startswith('_') or table not in self.baseline['table_schemas']:
+                continue
+            
+            try:
+                cursor.execute(f"SHOW CREATE TABLE `{table}`")
+                create_stmt = cursor.fetchone()
+                current_hash = hashlib.md5(
+                    str(create_stmt).encode()
+                ).hexdigest()
+                
+                baseline_hash = self.baseline['table_schemas'][table]
+                
+                if current_hash != baseline_hash:
+                    alert = {
+                        'type': 'SCHEMA_CHANGED',
+                        'severity': 'HIGH',
+                        'table': table,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    alerts.append(alert)
+                    print(f"  🚨 {table}: 结构已变更")
+                else:
+                    print(f"  ✓ {table}: 结构正常")
+                
+            except Exception as e:
+                print(f"  ⚠️  {table}: {e}")
+        
+        cursor.close()
+        conn.close()
+        
+        return alerts
+    
+    def run_full_check(self):
+        """运行完整检查"""
+        print("="*70)
+        print(f"🛡️  数据保护检查 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*70)
+        
+        all_alerts = []
+        
+        all_alerts.extend(self.check_delete_anomaly())
+        all_alerts.extend(self.check_schema_change())
+        
+        if all_alerts:
+            with open(self.alert_file, 'w') as f:
+                json.dump(all_alerts, f, indent=2)
+            
+            print(f"\n❌ 发现 {len(all_alerts)} 个问题")
+            
+            pause_file = Path('/opt/mysql-sync/PAUSE_SYNC')
+            with open(pause_file, 'w') as f:
+                f.write(json.dumps({
+                    'reason': 'Data protection alert',
+                    'alerts': all_alerts,
+                    'timestamp': datetime.now().isoformat()
+                }, indent=2))
+            
+            print(f"🚫 已暂停同步到Cloud SQL")
+            
+            # 构建告警消息
+            alert_msg = f"检测到 {len(all_alerts)} 个数据保护问题:\n\n"
+            for i, alert in enumerate(all_alerts, 1):
+                alert_type = alert.get('type', 'UNKNOWN')
+                table = alert.get('table', 'N/A')
+                alert_msg += f"{i}. {alert_type} - 表: {table}\n"
+            
+            alert_msg += "\n同步已自动暂停，等待人工确认。\n"
+            alert_msg += "详情: cat /opt/mysql-sync/PAUSE_SYNC"
+            
+            # 发送邮件告警
+            send_alert(alert_msg, 'CRITICAL')
+            
+            return False
+        else:
+            print("\n✅ 所有检查通过")
+            
+            pause_file = Path('/opt/mysql-sync/PAUSE_SYNC')
+            if pause_file.exists():
+                pause_file.unlink()
+                print("✓ 同步已启用")
+            
+            self.save_baseline()
+            return True
+
+if __name__ == '__main__':
+    protector = DataProtector()
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'init':
+        protector.create_baseline()
+    else:
+        result = protector.run_full_check()
+        sys.exit(0 if result else 1)
