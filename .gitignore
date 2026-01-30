@@ -2,3 +2,8 @@ backups/
 *.sql
 *.dump
 .env
+# 忽略备份文件内容，但保留目录
+backups/*.sql
+backups/*.dump
+# 但不忽略 .gitkeep
+!backups/.gitkeep
